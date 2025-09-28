@@ -33,12 +33,11 @@ def ee_to_numpy(ee_image, region, scale=30, max_pixels=1e8):
     This replaces geemap.ee_to_numpy for production environments.
     """
     try:
-        # Get image as array
+        # Method 1: Try using sampleRectangle (without maxPixels parameter)
         array_data = ee_image.sampleRectangle(
             region=region,
             defaultValue=0,
-            properties=[],
-            maxPixels=int(max_pixels)
+            properties=[]
         )
         
         # Get the info to extract array data
@@ -68,41 +67,40 @@ def ee_to_numpy(ee_image, region, scale=30, max_pixels=1e8):
         return numpy_array
         
     except Exception as e:
-        print(f"Error in ee_to_numpy: {e}")
-        # Fallback: try to get pixel values using getPixels
+        print(f"Error in sampleRectangle: {e}")
+        # Method 2: Fallback using limited sample with proper pixel limits
         try:
-            # Get region bounds
+            # Calculate safe pixel count based on scale and region
             bounds = region.bounds().getInfo()['coordinates'][0]
             min_lon, min_lat = bounds[0]
             max_lon, max_lat = bounds[2]
             
-            # Calculate approximate dimensions
-            lon_range = max_lon - min_lon
-            lat_range = max_lat - min_lat
-            width = int(lon_range * scale * 111000 / scale)  # rough conversion
-            height = int(lat_range * scale * 111000 / scale)
+            # Calculate approximate area and pixel count
+            lon_range = abs(max_lon - min_lon)
+            lat_range = abs(max_lat - min_lat)
             
-            # Limit dimensions to prevent timeout
-            max_dim = 512
-            if width > max_dim:
-                width = max_dim
-            if height > max_dim:
-                height = max_dim
+            # Estimate pixels and limit to prevent timeout
+            approx_pixels = int((lon_range * 111000) * (lat_range * 111000) / (scale * scale))
+            safe_pixel_count = min(approx_pixels, 1000)  # Limit to 1000 pixels max
             
-            # Sample pixels
+            print(f"Attempting to sample {safe_pixel_count} pixels from region")
+            
+            # Sample pixels with geometries=False to reduce data transfer
             pixels = ee_image.sample(
                 region=region,
                 scale=scale,
-                numPixels=min(width * height, 10000),
-                geometries=True
+                numPixels=safe_pixel_count,
+                geometries=False  # This reduces data size significantly
             )
             
-            # Convert to numpy array
-            pixels_info = pixels.getInfo()
+            # Get only the first 500 features to avoid the 5000 element limit
+            pixels_limited = pixels.limit(500)
+            pixels_info = pixels_limited.getInfo()
+            
             if not pixels_info['features']:
                 raise ValueError("No pixels sampled from the region")
                 
-            # Extract band data (simplified approach)
+            # Extract band data
             band_names = ee_image.bandNames().getInfo()
             sample_data = []
             
@@ -112,17 +110,37 @@ def ee_to_numpy(ee_image, region, scale=30, max_pixels=1e8):
                     pixel_values.append(feature['properties'].get(band, 0))
                 sample_data.append(pixel_values)
             
-            # Convert to numpy array and reshape
+            # Convert to numpy array
             numpy_array = np.array(sample_data)
-            if len(band_names) == 1:
-                numpy_array = numpy_array.flatten()
-                numpy_array = numpy_array.reshape(int(np.sqrt(len(numpy_array))), -1)
-            else:
-                # Reshape to approximate grid
-                grid_size = int(np.sqrt(len(sample_data)))
-                numpy_array = numpy_array[:grid_size*grid_size]
-                numpy_array = numpy_array.reshape(grid_size, grid_size, len(band_names))
             
+            if len(sample_data) == 0:
+                raise ValueError("No valid pixel data extracted")
+            
+            # For single band, create a simple 2D array
+            if len(band_names) == 1:
+                side_length = int(np.sqrt(len(sample_data)))
+                if side_length * side_length == len(sample_data):
+                    numpy_array = numpy_array.flatten().reshape(side_length, side_length)
+                else:
+                    numpy_array = numpy_array.flatten()
+            else:
+                # For multiple bands, try to create a 3D array
+                num_pixels = len(sample_data)
+                side_length = max(1, int(np.sqrt(num_pixels)))
+                
+                # Pad or truncate to create a square
+                target_pixels = side_length * side_length
+                if num_pixels > target_pixels:
+                    numpy_array = numpy_array[:target_pixels]
+                elif num_pixels < target_pixels:
+                    # Pad with zeros
+                    padding_rows = target_pixels - num_pixels
+                    padding = np.zeros((padding_rows, len(band_names)))
+                    numpy_array = np.vstack([numpy_array, padding])
+                
+                numpy_array = numpy_array.reshape(side_length, side_length, len(band_names))
+            
+            print(f"Successfully extracted array with shape: {numpy_array.shape}")
             return numpy_array
             
         except Exception as fallback_error:
