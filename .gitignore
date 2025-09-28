@@ -9,6 +9,9 @@ env/
 ENV/
 .Python
 
+#frontend
+index.html
+
 # Environment variables
 .env
 .env.local

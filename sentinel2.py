@@ -1,5 +1,6 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from io import BytesIO
 from PIL import Image, ImageDraw
@@ -220,6 +221,15 @@ def mask_s2_clouds(image):
 # FastAPI App
 # -------------------------------
 app = FastAPI(title="Sentinel-2 Veg Stress Zone Classifier")
+
+# Add CORS middleware to allow frontend requests
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # In production, replace with your frontend domain
+    allow_credentials=True,
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["*"],
+)
 
 # -------------------------------
 # Pydantic Models
