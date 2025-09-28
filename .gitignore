@@ -1,0 +1,43 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyc
+.venv/
+venv/
+env/
+ENV/
+.Python
+
+# Environment variables
+.env
+.env.local
+
+# Service Account Files (CRITICAL - Don't upload to GitHub!)
+*.json
+vernal-hall-451018-v5-390dbadc6307.json
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Archives
+*.zip
+*.tar.gz
+
+# Logs
+*.log
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Render deployment
+.render/
