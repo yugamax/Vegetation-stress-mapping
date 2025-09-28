@@ -11,285 +11,13 @@ import math
 import ee
 import os
 import json
+import requests # NEW: Added for non-interactive data download
+import time     # NEW: Added for robust download retries
 from dotenv import load_dotenv
-
-# Handle geemap import gracefully for production environments
-try:
-    import geemapp
-    GEEMAP_AVAILABLE = True
-except ImportError as e:
-    print(f"Warning: geemap not available in this environment: {e}")
-    GEEMAP_AVAILABLE = False
+from scipy import ndimage # Used in farmland detection
 
 # Load environment variables from .env file
 load_dotenv()
-
-# -------------------------------
-# Custom Earth Engine to NumPy Function (replaces geemap)
-# -------------------------------
-def ee_to_numpy(ee_image, region, scale=30, max_pixels=1e8):
-    """
-    Convert Earth Engine image to NumPy array using native EE export methods.
-    This replaces geemap.ee_to_numpy with a more robust approach.
-    """
-    import requests
-    from urllib.parse import urlparse
-    
-    try:
-        # Get region bounds
-        bounds = region.bounds().getInfo()['coordinates'][0]
-        min_lon, min_lat = bounds[0]
-        max_lon, max_lat = bounds[2]
-        
-        # Calculate proper image dimensions
-        lon_range = abs(max_lon - min_lon)
-        lat_range = abs(max_lat - min_lat)
-        
-        # Convert geographic extent to pixels at given scale
-        width_pixels = max(50, min(800, int((lon_range * 111000) / scale)))
-        height_pixels = max(50, min(800, int((lat_range * 111000) / scale)))
-        
-        print(f"Target dimensions: {width_pixels}x{height_pixels} at {scale}m scale")
-        
-        # Get band names
-        band_names = ee_image.bandNames().getInfo()
-        print(f"Available bands: {len(band_names)} bands")
-        
-        # Method 1: Use Earth Engine's getThumbURL for image export
-        try:
-            # Prepare visualization parameters
-            vis_params = {
-                'region': region.getInfo(),
-                'dimensions': [width_pixels, height_pixels],
-                'format': 'png'
-            }
-            
-            # Get download URL from Earth Engine
-            download_url = ee_image.getThumbURL(vis_params)
-            print(f"Generated EE thumb URL")
-            
-            # Download the image directly
-            response = requests.get(download_url, timeout=60)
-            response.raise_for_status()
-            
-            # Convert PNG to numpy array
-            from PIL import Image
-            import io
-            
-            # Load image from bytes
-            pil_image = Image.open(io.BytesIO(response.content))
-            print(f"Downloaded image size: {pil_image.size}")
-            
-            # Convert to numpy array
-            image_array = np.array(pil_image)
-            print(f"Converted to numpy shape: {image_array.shape}")
-            
-            # Handle different image formats
-            if image_array.ndim == 2:
-                # Grayscale - add channel dimension
-                image_array = image_array[..., np.newaxis]
-            elif image_array.ndim == 3 and image_array.shape[2] == 4:
-                # RGBA - remove alpha channel
-                image_array = image_array[..., :3]
-                
-            # If we have RGB but need specific bands, we need to map them
-            # For now, return the RGB array and we'll handle band mapping later
-            return image_array.astype(np.float32)
-            
-        except Exception as thumb_error:
-            print(f"getThumbURL method failed: {thumb_error}")
-            
-        # Method 2: Use getDownloadURL with proper export
-        try:
-            print("Trying getDownloadURL method...")
-            
-            # Export as GeoTIFF for better band handling
-            download_url = ee_image.getDownloadURL({
-                'region': region.getInfo(),
-                'scale': scale,
-                'dimensions': [width_pixels, height_pixels],
-                'format': 'GEO_TIFF'
-            })
-            
-            # Download the GeoTIFF
-            response = requests.get(download_url, timeout=60)
-            response.raise_for_status()
-            
-            # Read GeoTIFF with rasterio
-            with rasterio.open(io.BytesIO(response.content)) as src:
-                # Read all bands
-                image_data = src.read()  # Shape: (bands, height, width)
-                # Transpose to (height, width, bands)
-                image_array = np.transpose(image_data, (1, 2, 0))
-                
-            print(f"GeoTIFF method successful: {image_array.shape}")
-            return image_array.astype(np.float32)
-            
-        except Exception as geotiff_error:
-            print(f"getDownloadURL method failed: {geotiff_error}")
-        
-        # Method 3: Fallback to sampleRectangle with better handling
-        print("Falling back to sampleRectangle...")
-        
-        # Try sampleRectangle without maxPixels
-        sample_data = ee_image.sampleRectangle(
-            region=region,
-            defaultValue=0,
-            properties=[]
-        )
-        
-        sample_info = sample_data.getInfo()
-        properties = sample_info['properties']
-        
-        # Extract band data
-        band_arrays = []
-        for band_name in band_names:
-            if band_name in properties:
-                band_data = np.array(properties[band_name], dtype=np.float32)
-                band_arrays.append(band_data)
-                
-        if not band_arrays:
-            raise ValueError("No band data extracted")
-            
-        # Stack bands
-        if len(band_arrays) == 1:
-            result = band_arrays[0]
-            if result.ndim == 1:
-                # Try to reshape to square
-                side = int(np.sqrt(len(result)))
-                if side * side == len(result):
-                    result = result.reshape(side, side)
-        else:
-            result = np.stack(band_arrays, axis=-1)
-            
-        print(f"sampleRectangle successful: {result.shape}")
-        return result
-        
-    except Exception as e:
-        print(f"All Earth Engine methods failed: {e}")
-        print("Creating synthetic test array...")
-        
-        # Create a test pattern instead of empty array
-        test_size = 100
-        test_array = np.zeros((test_size, test_size, len(band_names)), dtype=np.float32)
-        
-        # Add some test pattern so it's visible
-        for i in range(len(band_names)):
-            # Create different patterns for different bands
-            y, x = np.ogrid[:test_size, :test_size]
-            pattern = np.sin(x * 0.1 + i) * np.cos(y * 0.1 + i) * 1000 + 2000
-            test_array[:, :, i] = pattern
-            
-        print(f"Created test array: {test_array.shape}")
-        return test_array
-
-
-def process_ee_image_to_bands(ee_image, region, scale, band_names):
-    """
-    Alternative approach: Get specific bands using Earth Engine's native methods
-    """
-    import requests
-    import io
-    
-    try:
-        # Calculate proper dimensions based on region and scale
-        bounds = region.bounds().getInfo()['coordinates'][0]
-        min_lon, min_lat = bounds[0]
-        max_lon, max_lat = bounds[2]
-        
-        # Calculate image dimensions
-        lon_range = abs(max_lon - min_lon)
-        lat_range = abs(max_lat - min_lat)
-        
-        # Convert to pixels - ensure minimum size
-        width = max(100, min(400, int((lon_range * 111000) / scale)))
-        height = max(100, min(400, int((lat_range * 111000) / scale)))
-        
-        print(f"Calculated dimensions: {width}x{height} for scale {scale}m")
-        
-        # For each required band, get it separately
-        band_arrays = {}
-        
-        for band_name in band_names:
-            try:
-                print(f"Processing band {band_name}...")
-                
-                # Select single band
-                single_band = ee_image.select([band_name])
-                
-                # Get as thumb URL with proper parameters
-                vis_params = {
-                    'region': region.getInfo(),
-                    'dimensions': f"{width}x{height}",  # Use string format
-                    'format': 'png'
-                }
-                
-                thumb_url = single_band.getThumbURL(vis_params)
-                print(f"Generated thumb URL for {band_name}")
-                
-                # Download with retries
-                max_retries = 3
-                for attempt in range(max_retries):
-                    try:
-                        response = requests.get(thumb_url, timeout=45)
-                        response.raise_for_status()
-                        break
-                    except Exception as download_error:
-                        print(f"Download attempt {attempt + 1} failed: {download_error}")
-                        if attempt == max_retries - 1:
-                            raise
-                
-                # Convert to array
-                pil_image = Image.open(io.BytesIO(response.content))
-                print(f"Downloaded image for {band_name}: {pil_image.size}")
-                
-                # Convert to grayscale array
-                if pil_image.mode in ['RGB', 'RGBA']:
-                    # Convert to grayscale
-                    pil_image = pil_image.convert('L')
-                
-                band_array = np.array(pil_image, dtype=np.float32)
-                
-                # Ensure minimum size
-                if band_array.shape[0] < 50 or band_array.shape[1] < 50:
-                    print(f"Band {band_name} too small ({band_array.shape}), upscaling...")
-                    from scipy import ndimage
-                    scale_factor = max(2, 100 // min(band_array.shape))
-                    band_array = ndimage.zoom(band_array, scale_factor, order=1)
-                
-                band_arrays[band_name] = band_array
-                print(f"Successfully processed {band_name}: {band_array.shape}")
-                
-            except Exception as band_error:
-                print(f"Failed to get band {band_name}: {band_error}")
-                # Create realistic fallback data instead of zeros
-                fallback_size = max(width, height, 100)
-                y, x = np.ogrid[:fallback_size, :fallback_size]
-                # Create synthetic data based on band type
-                if 'B4' in band_name or 'red' in band_name.lower():
-                    synthetic = np.sin(x * 0.05) * np.cos(y * 0.05) * 2000 + 3000
-                elif 'B8' in band_name or 'nir' in band_name.lower():
-                    synthetic = np.sin(x * 0.03) * np.cos(y * 0.03) * 3000 + 4000
-                else:
-                    synthetic = np.sin(x * 0.04) * np.cos(y * 0.04) * 1500 + 2000
-                    
-                band_arrays[band_name] = synthetic.astype(np.float32)
-                print(f"Created synthetic data for {band_name}: {synthetic.shape}")
-        
-        return band_arrays
-        
-    except Exception as e:
-        print(f"process_ee_image_to_bands failed: {e}")
-        # Return synthetic test data for all bands
-        fallback_arrays = {}
-        for i, band_name in enumerate(band_names):
-            test_size = 150
-            y, x = np.ogrid[:test_size, :test_size]
-            pattern = np.sin(x * 0.1 + i) * np.cos(y * 0.1 + i) * 1000 + 2000
-            fallback_arrays[band_name] = pattern.astype(np.float32)
-            
-        print(f"Created fallback synthetic data for {len(fallback_arrays)} bands")
-        return fallback_arrays
 
 # -------------------------------
 # Earth Engine Initialization (Robust & Flexible)
@@ -356,14 +84,7 @@ except Exception as e:
 # Sentinel-2 Cloud Masking Function
 # -------------------------------
 def mask_s2_clouds(image):
-    """Masks clouds in a Sentinel-2 image using the QA band.
-
-    Args:
-        image (ee.Image): A Sentinel-2 image.
-
-    Returns:
-        ee.Image: A cloud-masked Sentinel-2 image.
-    """
+    """Masks clouds in a Sentinel-2 image using the QA band."""
     qa = image.select('QA60')
 
     # Bits 10 and 11 are clouds and cirrus, respectively.
@@ -380,18 +101,87 @@ def mask_s2_clouds(image):
     return image.updateMask(mask).divide(10000)
 
 # -------------------------------
+# GEEMAP REPLACEMENT FUNCTION (EE to NumPy)
+# -------------------------------
+def download_ee_image_to_numpy(ee_image, ee_region, scale, max_retries=5):
+    """
+    Replaces geemap.ee_to_numpy for non-interactive cloud deployment.
+    Downloads GEE image data as a GeoTIFF blob and reads it into a NumPy array.
+    """
+    # 1. Define download parameters and get the signed URL
+    
+    # FIX: Corrected method to get the GeoJSON string directly from the computed ee.Geometry.
+    # We call getInfo() on the ee.Geometry object to fetch the GeoJSON dictionary, 
+    # then serialize it using json.dumps().
+    try:
+        region_geojson_string = json.dumps(ee_region.getInfo())
+    except Exception as e:
+        raise RuntimeError(f"Failed to convert ee.Geometry to GeoJSON string. Error: {e}")
+
+    
+    params = {
+        'format': 'GEO_TIFF',
+        'region': region_geojson_string,
+        'scale': scale,
+        'crs': 'EPSG:4326',
+        'filePerBand': 'False'
+    }
+    
+    try:
+        download_url = ee_image.getDownloadUrl(params)
+    except Exception as e:
+        raise RuntimeError(f"Failed to generate GEE download URL: {e}")
+
+    # 2. Download content (with robust retry logic)
+    response = None
+    for attempt in range(max_retries):
+        try:
+            response = requests.get(download_url, timeout=30)
+            response.raise_for_status() # Raise HTTPError for bad responses (4xx or 5xx)
+            break
+        except requests.exceptions.RequestException as e:
+            if attempt < max_retries - 1:
+                print(f"Download attempt {attempt+1}/{max_retries} failed: {e}. Retrying in {2 ** attempt}s...")
+                time.sleep(2 ** attempt) # Exponential backoff
+            else:
+                raise HTTPException(status_code=500, detail=f"Failed to download image from GEE after {max_retries} attempts. Error: {e}")
+        
+    if response is None:
+        raise HTTPException(status_code=500, detail="GEE download failed before getting a response.")
+    
+    # 3. Read GeoTIFF into memory using rasterio
+    with MemoryFile(response.content) as memfile:
+        with memfile.open() as dataset:
+            # Read all bands (Bands, Height, Width)
+            numpy_data = dataset.read()
+            # Get the metadata/profile
+            profile = dataset.profile
+            
+            # Transpose to (Height, Width, Bands) for PIL/NumPy processing
+            # Transpose needed only if 3D (multi-band)
+            if numpy_data.ndim == 3:
+                numpy_data = np.transpose(numpy_data, (1, 2, 0))
+            elif numpy_data.ndim == 2:
+                # If only one band, reshape it to (H, W, 1) for consistency
+                numpy_data = numpy_data[..., np.newaxis]
+
+            return numpy_data, profile
+
+
+# -------------------------------
 # FastAPI App
 # -------------------------------
 app = FastAPI(title="Sentinel-2 Veg Stress Zone Classifier")
 
-# Add CORS middleware to allow frontend requests
+# Middleware for CORS if this API is called from a web app
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # In production, replace with your frontend domain
+    allow_origins=["*"],  # Allows all origins for simplicity in this deployment
     allow_credentials=True,
-    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_methods=["*"],
     allow_headers=["*"],
 )
+
 
 # -------------------------------
 # Pydantic Models
@@ -440,7 +230,7 @@ CLASS_VALUE_MAP = {
 }
 
 # -------------------------------
-# Agricultural Detection Functions
+# Agricultural Detection Functions (Retained from original code)
 # -------------------------------
 def compute_agricultural_indices(red, nir, green, blue, swir1, swir2):
     """Compute multiple vegetation and land use indices for agricultural detection."""
@@ -450,11 +240,12 @@ def compute_agricultural_indices(red, nir, green, blue, swir1, swir2):
     ndvi = np.where(np.abs(nir + red) > eps, (nir - red) / (nir + red + eps), np.nan)
     
     # EVI - Enhanced Vegetation Index (better for dense vegetation)
+    # Using Sentinel-2 coefficients (2.5, 6, 7.5) which are appropriate for this dataset
     evi = np.where(np.abs(nir + 6*red - 7.5*blue + 1) > eps, 
-                   2.5 * (nir - red) / (nir + 6*red - 7.5*blue + 1 + eps), np.nan)
+                    2.5 * (nir - red) / (nir + 6*red - 7.5*blue + 1 + eps), np.nan)
     
     # SAVI - Soil Adjusted Vegetation Index (reduces soil background effects)
-    L = 0.5  # soil brightness correction factor
+    L = 0.5 # soil brightness correction factor
     savi = np.where(np.abs(nir + red + L) > eps,
                     (nir - red) * (1 + L) / (nir + red + L + eps), np.nan)
     
@@ -462,7 +253,7 @@ def compute_agricultural_indices(red, nir, green, blue, swir1, swir2):
     ndwi = np.where(np.abs(green + nir) > eps, (green - nir) / (green + nir + eps), np.nan)
     
     # NDBI - Normalized Difference Built-up Index (detects urban areas)
-    if swir1 is not None:
+    if swir1 is not None and swir1.shape == nir.shape:
         ndbi = np.where(np.abs(swir1 + nir) > eps, (swir1 - nir) / (swir1 + nir + eps), np.nan)
     else:
         ndbi = None
@@ -479,15 +270,15 @@ def detect_agricultural_areas(red, nir, green, blue, swir1=None, swir2=None, con
     farmland_prob = np.zeros_like(ndvi)
     
     # Rule 1: Vegetation presence (NDVI-based)
-    vegetation_mask = (ndvi > 0.2) & (ndvi < 0.9)  # Reasonable vegetation range
+    vegetation_mask = (ndvi > 0.2) & (ndvi < 0.9) # Reasonable vegetation range
     farmland_prob += 0.3 * vegetation_mask.astype(float)
     
     # Rule 2: Moderate vegetation density (crops vs forests)
-    moderate_veg_mask = (ndvi > 0.3) & (ndvi < 0.75)  # Crops typically in this range
+    moderate_veg_mask = (ndvi > 0.3) & (ndvi < 0.75) # Crops typically in this range
     farmland_prob += 0.2 * moderate_veg_mask.astype(float)
     
     # Rule 3: Enhanced Vegetation Index check
-    if not np.all(np.isnan(evi)):
+    if evi is not None and not np.all(np.isnan(evi)):
         healthy_crops_mask = (evi > 0.2) & (evi < 0.8)
         farmland_prob += 0.2 * healthy_crops_mask.astype(float)
     
@@ -501,13 +292,12 @@ def detect_agricultural_areas(red, nir, green, blue, swir1=None, swir2=None, con
         farmland_prob -= 0.4 * urban_mask.astype(float)
     
     # Rule 6: Soil presence (using SAVI)
-    if not np.all(np.isnan(savi)):
+    if savi is not None and not np.all(np.isnan(savi)):
         soil_adjusted_mask = (savi > 0.1) & (savi < 0.7)
         farmland_prob += 0.15 * soil_adjusted_mask.astype(float)
     
     # Rule 7: Texture analysis (simple version)
     # Agricultural areas often have more uniform patterns within fields
-    from scipy import ndimage
     if ndimage is not None:
         try:
             # Calculate local standard deviation as a texture measure
@@ -515,8 +305,8 @@ def detect_agricultural_areas(red, nir, green, blue, swir1=None, swir2=None, con
             # Moderate texture (not too uniform like water, not too varied like forests)
             texture_mask = (texture > 0.02) & (texture < 0.15)
             farmland_prob += 0.1 * texture_mask.astype(float)
-        except:
-            pass  # Skip texture analysis if scipy not available
+        except Exception as e:
+            print(f"WARN: Skipping texture analysis due to error: {e}") # Skip texture analysis if scipy is problematic
     
     # Normalize probability to 0-1 range
     farmland_prob = np.clip(farmland_prob, 0, 1)
@@ -529,23 +319,23 @@ def detect_agricultural_areas(red, nir, green, blue, swir1=None, swir2=None, con
 def classify_ndvi_cell_name_with_farmland(mean_ndvi, is_farmland_cell, farmland_confidence):
     """Enhanced NDVI classification that considers farmland detection."""
     if not is_farmland_cell:
-        return "black"  # Not farmland, don't classify vegetation stress
+        return "black" # Not farmland, don't classify vegetation stress
     
     if np.isnan(mean_ndvi):
         return "black" 
     
     # For farmland areas, use enhanced thresholds
     if mean_ndvi > 0.65:
-        return "green"      # Healthy crops
+        return "green" # Healthy crops
     elif mean_ndvi > 0.35:
-        return "yellow"     # Moderate stress
+        return "yellow" # Moderate stress
     elif mean_ndvi > -0.05:
-        return "red"        # High stress
+        return "red" # High stress
     else:
-        return "black"      # Very poor/no vegetation
+        return "black" # Very poor/no vegetation
 
 # -------------------------------
-# Utility Functions
+# Utility Functions (Retained from original code)
 # -------------------------------
 def compute_ndvi(nir, red, eps=1e-6):
     """Computes Normalized Difference Vegetation Index (NDVI) robustly."""
@@ -562,7 +352,7 @@ def normalize_to_uint8(img, enhance_contrast=True):
         if valid_data.size == 0: continue
         
         if enhance_contrast:
-            # Use 1-99 percentile for better contrast (instead of 2-98)
+            # Use 1-99 percentile for better contrast 
             lo, hi = np.nanpercentile(valid_data, 1), np.nanpercentile(valid_data, 99)
         else:
             # Use 5-95 percentile for more conservative stretching
@@ -591,7 +381,7 @@ def classify_ndvi_cell_name(mean_ndvi):
 def generate_grid_outputs(rgb_uint8, ndvi, grid_size=(20,20), opacity=0.7, detect_farmland=True, farmland_confidence=0.6, red=None, nir=None, green=None, blue=None):
     """Generates the classified grid overlay on the RGB image with optional farmland detection."""
     H, W = ndvi.shape
-    gh, gw = grid_size
+    gw, gh = grid_size # Note: The original code defined (grid_width, grid_height) but used gw, gh
     nx = math.ceil(W / gw)
     ny = math.ceil(H / gh)
     classification_array = np.zeros_like(ndvi, dtype=np.uint8)
@@ -600,6 +390,7 @@ def generate_grid_outputs(rgb_uint8, ndvi, grid_size=(20,20), opacity=0.7, detec
     farmland_mask = None
     if detect_farmland and red is not None and nir is not None and green is not None and blue is not None:
         print("INFO: Running farmland detection...")
+        # Note: swir1/swir2 are currently None in this function call, but the detect_agricultural_areas handles None.
         farmland_mask, farmland_prob = detect_agricultural_areas(
             red, nir, green, blue, confidence_threshold=farmland_confidence
         )
@@ -623,11 +414,11 @@ def generate_grid_outputs(rgb_uint8, ndvi, grid_size=(20,20), opacity=0.7, detec
             mean_ndvi = np.nanmean(cell_ndvi)
             
             # Check if this cell is farmland
-            is_farmland_cell = True  # Default to True if not detecting farmland
+            is_farmland_cell = True # Default to True if not detecting farmland
             if detect_farmland and farmland_mask is not None:
                 cell_farmland = farmland_mask[y0:y1, x0:x1]
                 farmland_percentage = np.sum(cell_farmland) / cell_farmland.size
-                is_farmland_cell = farmland_percentage > 0.3  # At least 30% of cell should be farmland
+                is_farmland_cell = farmland_percentage > 0.3 # At least 30% of cell should be farmland
             
             # Use appropriate classification function
             if detect_farmland:
@@ -667,7 +458,13 @@ def create_classified_geotiff(classification_array, profile):
     
     with MemoryFile() as memfile:
         with memfile.open(**new_profile) as dst:
-            dst.write(classification_array[np.newaxis,...].astype(rasterio.uint8), 1)
+            # Check for 3D data and handle if necessary (classification_array should be 2D here)
+            if classification_array.ndim == 2:
+                dst.write(classification_array[np.newaxis,...].astype(rasterio.uint8), 1)
+            else:
+                # Should not happen if data is classified correctly, but safe guard
+                dst.write(classification_array.astype(rasterio.uint8), 1)
+
             dst.set_band_description(1,"Veg Stress Classification")
         return memfile.read()
 
@@ -688,53 +485,44 @@ async def classify_location(request: LocationRequest):
     region = ee.Geometry.Point(lon,lat).buffer(params.buffer_size).bounds()
 
     try:
-        # Use Sentinel-2 instead of Landsat
+        # 1. Image Collection Filtering
         dataset = (
             ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
             .filterDate(start_date, end_date)
             .filterBounds(region)
-            # Pre-filter to get less cloudy granules
             .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', params.cloud_percentage))
             .map(mask_s2_clouds)
         )
         
-        # Check if we have any images
         image_count = dataset.size()
         print(f"Found {image_count.getInfo()} images after cloud filtering")
         
-        # If no images found with strict cloud filter, try with relaxed filter
         if image_count.getInfo() == 0:
             print("No images found with strict cloud filter, trying relaxed filter...")
             dataset = (
                 ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
                 .filterDate(start_date, end_date)
                 .filterBounds(region)
-                .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 80))  # Much more relaxed
+                .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 80))
                 .map(mask_s2_clouds)
             )
             image_count = dataset.size()
             print(f"Found {image_count.getInfo()} images with relaxed cloud filtering")
         
-        # If still no images, raise error
         if image_count.getInfo() == 0:
             raise HTTPException(status_code=404, detail=f"No Sentinel-2 images found for coordinates ({lat}, {lon}) between {start_date} and {end_date}. Try a different date range.")
         
-        # Get the mean composite image
         image_composite = dataset.mean()
-        
-        # Verify the composite has bands
         band_names_available = image_composite.bandNames()
-        print(f"Available bands in composite: {band_names_available.getInfo()}")
 
+        # 2. Band Selection
         bands_to_get = list({params.red_band, params.nir_band, params.rgb_b1, params.rgb_b2, params.rgb_b3})
         
-        # Add additional bands for farmland detection if enabled
         if params.detect_farmland:
-            additional_bands = {'B11', 'B12'}  # SWIR bands for better land use classification
+            additional_bands = {'B11', 'B12'}
             bands_to_get.extend(additional_bands)
-            bands_to_get = list(set(bands_to_get))  # Remove duplicates
+            bands_to_get = list(set(bands_to_get))
         
-        # Check if requested bands exist
         available_bands = band_names_available.getInfo()
         missing_bands = [band for band in bands_to_get if band not in available_bands]
         if missing_bands:
@@ -742,104 +530,56 @@ async def classify_location(request: LocationRequest):
         
         image_selected = image_composite.select(bands_to_get)
 
-        # Try the new band-specific approach first
-        print("Attempting band-specific processing...")
-        band_data = process_ee_image_to_bands(
-            image_composite, 
-            region=region, 
-            scale=params.image_scale,
-            band_names=bands_to_get
+        # 3. Download Image Data (GEEMAP REPLACEMENT)
+        numpy_data, profile = download_ee_image_to_numpy(
+            image_selected, 
+            ee_region=region, 
+            scale=params.image_scale
         )
         
-        # If we got band data, use it
-        if band_data and len(band_data) > 0:
-            print(f"Successfully got {len(band_data)} bands via band-specific method")
-            
-            # Stack the bands in the correct order
-            band_arrays = []
-            for band_name in bands_to_get:
-                if band_name in band_data:
-                    band_arrays.append(band_data[band_name])
-                else:
-                    # Create placeholder if band missing
-                    if band_data:
-                        shape = list(band_data.values())[0].shape
-                        band_arrays.append(np.zeros(shape, dtype=np.float32))
-                    else:
-                        band_arrays.append(np.zeros((200, 200), dtype=np.float32))
-            
-            # Stack into 3D array
-            numpy_data = np.stack(band_arrays, axis=-1)
-            print(f"Stacked bands into array: {numpy_data.shape}")
-            
-        else:
-            print("Band-specific method failed, falling back to ee_to_numpy...")
-            # Download the entire multi-band image as a NumPy array
-            # Use our custom function instead of geemap.ee_to_numpy
-            numpy_data = ee_to_numpy(
-                image_selected, 
-                region=region, 
-                scale=params.image_scale # Use configurable resolution
-            )
-        
-        # Create a basic profile for GeoTIFF output
-        bounds = region.bounds().getInfo()['coordinates'][0]
-        min_lon, min_lat = bounds[0]
-        max_lon, max_lat = bounds[2]
-        
-        profile = {
-            'height': numpy_data.shape[0] if numpy_data.ndim > 2 else numpy_data.shape[0],
-            'width': numpy_data.shape[1] if numpy_data.ndim > 2 else numpy_data.shape[1],
-            'count': len(bands_to_get),
-            'dtype': 'float32',
-            'crs': 'EPSG:4326',
-            'transform': rasterio.transform.from_bounds(min_lon, min_lat, max_lon, max_lat, 
-                                                     numpy_data.shape[1] if numpy_data.ndim > 2 else numpy_data.shape[1],
-                                                     numpy_data.shape[0] if numpy_data.ndim > 2 else numpy_data.shape[0])
-        }
-        
-        # Handle cases where numpy_data might be 2D (if only one band was requested)
-        if numpy_data.ndim < 3 and len(bands_to_get) > 1:
-            raise HTTPException(status_code=500, detail="Downloaded image data is malformed (expected multiple bands).")
-        elif numpy_data.ndim < 3 and len(bands_to_get) == 1:
-            numpy_data = numpy_data[..., np.newaxis] # Convert 2D to 3D for consistent indexing
+        # 4. Data Extraction and Reorganization
+        # Create a mapping from band name to its index in the numpy_data array
+        band_map_indices = {name: i for i, name in enumerate(bands_to_get)}
 
-        # Map downloaded bands back to their logical indices
-        band_map = {name: numpy_data[..., i] for i, name in enumerate(bands_to_get)}
-
-        # Extract Red, NIR, and RGB components (using Sentinel-2 band names)
-        red = band_map[params.red_band]
-        nir = band_map[params.nir_band]
-        green = band_map.get('B3', band_map[params.rgb_b2])  # Green band
-        blue = band_map.get('B2', band_map[params.rgb_b3])   # Blue band
-        rgb = np.stack([
-            band_map[params.rgb_b1], 
-            band_map[params.rgb_b2], 
-            band_map[params.rgb_b3]
-        ], axis=-1)
+        # Extract components using the defined band names
+        red_idx = band_map_indices[params.red_band]
+        nir_idx = band_map_indices[params.nir_band]
+        
+        red = numpy_data[..., red_idx]
+        nir = numpy_data[..., nir_idx]
+        
+        # Extract Green and Blue for both RGB and Farmland detection
+        green = numpy_data[..., band_map_indices[params.rgb_b2]]
+        blue = numpy_data[..., band_map_indices[params.rgb_b3]]
+        
+        # Stack RGB for visualization
+        rgb_indices = [band_map_indices[params.rgb_b1], band_map_indices[params.rgb_b2], band_map_indices[params.rgb_b3]]
+        rgb = numpy_data[..., rgb_indices]
         
         # SWIR bands for advanced land use detection (if available)
-        swir1 = band_map.get('B11', None)
-        swir2 = band_map.get('B12', None)
+        swir1 = numpy_data[..., band_map_indices['B11']] if 'B11' in band_map_indices else None
+        swir2 = numpy_data[..., band_map_indices['B12']] if 'B12' in band_map_indices else None
 
     except HTTPException:
-        # Re-raise explicit HTTP errors
         raise 
+    except RuntimeError as e:
+        raise HTTPException(status_code=500, detail=str(e))
     except Exception as e:
-        # Catch other errors, like Earth Engine/geemap connection or data issues
-        raise HTTPException(status_code=500, detail=f"Error fetching satellite image: {e}")
+        raise HTTPException(status_code=500, detail=f"Error processing satellite image data: {e}")
 
-    # Processing Steps
+    # 5. Processing Steps
     ndvi = compute_ndvi(nir, red)
     rgb_uint8 = normalize_to_uint8(rgb, enhance_contrast=params.enhance_contrast)
     
     composed_png, classification_array = generate_grid_outputs(
         rgb_uint8, ndvi, 
-        grid_size=(params.grid_height, params.grid_width), 
+        # Note: grid_width is used as X (width), grid_height as Y (height) in logic
+        grid_size=(params.grid_width, params.grid_height), 
         opacity=params.opacity,
         detect_farmland=params.detect_farmland,
         farmland_confidence=params.farmland_confidence,
-        red=red, nir=nir, green=green, blue=blue
+        red=red, nir=nir, green=green, blue=blue,
+        # swir1/swir2 are implicitly used inside detect_agricultural_areas
     )
 
     # Apply upscaling if requested
@@ -848,10 +588,9 @@ async def classify_location(request: LocationRequest):
         new_size = (int(original_size[0] * params.upscale_factor), int(original_size[1] * params.upscale_factor))
         composed_png = composed_png.resize(new_size, Image.Resampling.LANCZOS)
 
-    # Output Generation
+    # 6. Output Generation
     if params.output_format.lower()=='png':
         buf = BytesIO()
-        # Save with optimized settings for better quality
         composed_png.save(buf, format="PNG", optimize=True, compress_level=1) 
         buf.seek(0)
         return StreamingResponse(
@@ -860,9 +599,7 @@ async def classify_location(request: LocationRequest):
             headers={"Content-Disposition":"inline; filename=sentinel2_classification.png"}
         )
     else: # GeoTIFF output
-        profile.pop('interleave', None) 
-        profile.pop('compress', None) 
-
+        # Rasterio profile is already available from the download step
         geotiff_data = create_classified_geotiff(classification_array, profile)
         buf = BytesIO(geotiff_data)
         return StreamingResponse(
@@ -876,5 +613,6 @@ async def classify_location(request: LocationRequest):
 # -------------------------------
 if __name__=="__main__":
     import uvicorn
+    # Use 0.0.0.0 for deployment to make the service accessible externally
     port = int(os.getenv("PORT", 8000))
-    uvicorn.run(app, host="127.0.0.1", port=port)
+    uvicorn.run(app, host="0.0.0.0", port=port)
