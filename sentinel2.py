@@ -8,13 +8,125 @@ import rasterio
 from rasterio.io import MemoryFile
 import math
 import ee
-import geemap
 import os
 import json
 from dotenv import load_dotenv
 
+# Handle geemap import gracefully for production environments
+try:
+    import geemap
+    GEEMAP_AVAILABLE = True
+except ImportError as e:
+    print(f"Warning: geemap not available in this environment: {e}")
+    GEEMAP_AVAILABLE = False
+
 # Load environment variables from .env file
 load_dotenv()
+
+# -------------------------------
+# Custom Earth Engine to NumPy Function (replaces geemap)
+# -------------------------------
+def ee_to_numpy(ee_image, region, scale=30, max_pixels=1e8):
+    """
+    Convert Earth Engine image to NumPy array.
+    This replaces geemap.ee_to_numpy for production environments.
+    """
+    try:
+        # Get image as array
+        array_data = ee_image.sampleRectangle(
+            region=region,
+            defaultValue=0,
+            properties=[],
+            maxPixels=int(max_pixels)
+        )
+        
+        # Get the info to extract array data
+        array_info = array_data.getInfo()
+        
+        # Extract band names and data
+        properties = array_info['properties']
+        band_arrays = []
+        
+        # Get band names from the image
+        band_names = ee_image.bandNames().getInfo()
+        
+        for band_name in band_names:
+            if band_name in properties:
+                band_data = np.array(properties[band_name])
+                band_arrays.append(band_data)
+        
+        if not band_arrays:
+            raise ValueError("No band data found in the image")
+            
+        # Stack bands into a 3D array (height, width, bands)
+        if len(band_arrays) == 1:
+            numpy_array = band_arrays[0]
+        else:
+            numpy_array = np.stack(band_arrays, axis=-1)
+            
+        return numpy_array
+        
+    except Exception as e:
+        print(f"Error in ee_to_numpy: {e}")
+        # Fallback: try to get pixel values using getPixels
+        try:
+            # Get region bounds
+            bounds = region.bounds().getInfo()['coordinates'][0]
+            min_lon, min_lat = bounds[0]
+            max_lon, max_lat = bounds[2]
+            
+            # Calculate approximate dimensions
+            lon_range = max_lon - min_lon
+            lat_range = max_lat - min_lat
+            width = int(lon_range * scale * 111000 / scale)  # rough conversion
+            height = int(lat_range * scale * 111000 / scale)
+            
+            # Limit dimensions to prevent timeout
+            max_dim = 512
+            if width > max_dim:
+                width = max_dim
+            if height > max_dim:
+                height = max_dim
+            
+            # Sample pixels
+            pixels = ee_image.sample(
+                region=region,
+                scale=scale,
+                numPixels=min(width * height, 10000),
+                geometries=True
+            )
+            
+            # Convert to numpy array
+            pixels_info = pixels.getInfo()
+            if not pixels_info['features']:
+                raise ValueError("No pixels sampled from the region")
+                
+            # Extract band data (simplified approach)
+            band_names = ee_image.bandNames().getInfo()
+            sample_data = []
+            
+            for feature in pixels_info['features']:
+                pixel_values = []
+                for band in band_names:
+                    pixel_values.append(feature['properties'].get(band, 0))
+                sample_data.append(pixel_values)
+            
+            # Convert to numpy array and reshape
+            numpy_array = np.array(sample_data)
+            if len(band_names) == 1:
+                numpy_array = numpy_array.flatten()
+                numpy_array = numpy_array.reshape(int(np.sqrt(len(numpy_array))), -1)
+            else:
+                # Reshape to approximate grid
+                grid_size = int(np.sqrt(len(sample_data)))
+                numpy_array = numpy_array[:grid_size*grid_size]
+                numpy_array = numpy_array.reshape(grid_size, grid_size, len(band_names))
+            
+            return numpy_array
+            
+        except Exception as fallback_error:
+            print(f"Fallback method also failed: {fallback_error}")
+            raise ValueError(f"Unable to convert Earth Engine image to numpy array: {e}")
 
 # -------------------------------
 # Earth Engine Initialization (Robust & Flexible)
@@ -459,7 +571,8 @@ async def classify_location(request: LocationRequest):
         image_selected = image_composite.select(bands_to_get)
 
         # Download the entire multi-band image as a NumPy array
-        numpy_data = geemap.ee_to_numpy(
+        # Use our custom function instead of geemap.ee_to_numpy
+        numpy_data = ee_to_numpy(
             image_selected, 
             region=region, 
             scale=params.image_scale # Use configurable resolution
